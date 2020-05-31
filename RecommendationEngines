@@ -1,0 +1,760 @@
+---
+title: "Building a Movie Recommendation Engine"
+author: ”Rasagnya Reddy Avala”
+date: "4/16/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading libraries
+
+
+```{r cars}
+library(tidyverse)
+library(scales)
+library(jsonlite)
+library(knitr)
+library(kableExtra)
+library(ggrepel)
+library(gridExtra)
+library(lubridate)
+library(tidytext)
+library(wordcloud)
+library(recommenderlab)
+library(treemap)
+library(plotly)
+
+```
+
+## Importing data and getting summaries
+## Importing the TMDB movies and credits datasets
+
+
+```{r import}
+movies <- read_csv("tmdb_5000_movies.csv",na="NA")
+credits <- read_csv("tmdb_5000_credits.csv",na="NA")
+glimpse(movies)
+
+summary(movies)
+summary(credits)
+
+```
+## Getting in Keywords and genres columns in tidy format
+
+```{r}
+  keywords <- movies %>%
+      filter(nchar(keywords)>2) %>%
+      mutate(
+        js=lapply(keywords,fromJSON)
+      ) %>%
+  unnest(js, .name_repair="unique") %>%
+  select(id,title,keyword=name) %>%
+  mutate_if(is.character,factor)
+
+genres <- movies%>%
+  filter(nchar(genres)>2) %>%
+  mutate(js=lapply(genres,fromJSON)) %>%
+  unnest(js, .name_repair="unique") %>%
+  select(id,title,genres=name) %>%
+  mutate_if(is.character,factor)
+
+```
+
+## Joining the Top 3 genres to make sure only 3 genres are shown for each movie
+## Assumption -  genres are ranked in order of importance in dataset
+
+```{r}
+kable(genres[1:14,])
+
+genres3<-genres
+genres3$order <- 0
+genres3$order[1] <- 1
+
+for(i in 1:(nrow(genres3)-1)) {
+  if(genres3$id[i+1]!=genres3$id[i]){
+      genres3$order[i+1] <- 1
+  } else {genres3$order[i+1] <- (genres3$order[i])+1}
+}
+genres3 <- genres3 %>% filter(order<5) %>%
+    spread(key=order, value=genres) %>%
+    rename(genre_1="1", genre_2="2", genre_3="3", genre_4="4")
+    
+movies <- left_join(movies,genres3 %>% select(id, genre_1,genre_2,genre_3), 
+by="id")
+
+```
+
+## Joinging Top 3 keywords
+
+```{r}
+keywords3<-keywords
+keywords3$order <- 0
+keywords3$order[1] <- 1
+for(i in 1:(nrow(keywords3)-1)) {
+  if(keywords3$id[i+1]!=keywords3$id[i]){
+      keywords3$order[i+1] <- 1
+  } else {keywords3$order[i+1] <- (keywords3$order[i])+1}
+}
+keywords3 <- keywords3 %>% filter(order<5) %>%
+    spread(key=order, value=keyword) %>%
+    rename(keyword_1="1", keyword_2="2", keyword_3="3", keyword_4="4")
+    
+movies <- left_join(movies,keywords3 %>% select(id, 
+keyword_1,keyword_2,keyword_3), by="id")
+
+```
+
+## Credits dataset
+## Getting the top 3 actors per movie from credits datase
+```{r}
+glimpse(credits)
+cast <- credits %>%
+        filter(nchar(cast)>2) %>%
+        mutate(js = lapply(cast, fromJSON)) %>%
+        unnest(js) %>%
+        select(-cast, -crew, -credit_id) %>%
+        rename(actor=name, movie_cast_id=cast_id, actor_id=id) %>%
+        mutate_if(is.character, factor)
+
+glimpse(cast)
+
+```
+
+## In this dataset the "order" variable indicated whether it was a leading/important role or not.
+## For instance, in the movie Avatar, Sam Worthington was the leading actor and so has the order - 0,  indicating that he was the most important cast member,Checking the order of actors for Avatar movie
+
+```{r}
+kable(cast %>% filter(title=="Avatar") %>% 
+        select(title, order, actor, character) %>% arrange(order) %>% slice(1:10))
+
+cast1 <- cast %>% count(actor) # for visualisation later on
+
+cast <- cast %>% 
+filter(order %in% c(0, 1, 2)) %>% 
+select(movie_id, title, order, actor)
+
+```
+
+## Checking the top 3 actors for Titanic
+
+```{r}
+kable(cast %>% filter(movie_id==597))
+
+cast$order[1] <- 0
+for (i in 1:(nrow(cast)-1)){
+        if(cast$movie_id[i+1]!=cast$movie_id[i]){
+                cast$order[i+1] <- 0
+        } else {cast$order[i+1] <- cast$order[i]+1}
+}
+
+
+cast <- cast %>% spread(key=order, value=actor) %>%
+        rename(actor_1="0", actor_2="1", actor_3="2")
+
+```
+## Joining this dataframe with the Top3 actors for each movie to the movies dataframe
+```{r}
+movies <- left_join(movies, cast %>%
+select(id=movie_id, actor_1, actor_2, actor_3), by = "id")
+
+```
+
+
+```{r}
+#Joining Director for each movie
+crew <- credits %>%
+        filter(nchar(crew)>2) %>%
+        mutate(js = lapply(crew, fromJSON)) %>%
+        unnest(js) %>%
+        select(-cast, -crew, -credit_id) %>%
+        rename(crew=name, crew_id=id) %>%
+        mutate_if(is.character, factor)
+
+glimpse(crew)
+
+#Since movies sometimes have multiple directors we are only joining the movies with unique directors
+movies1Director <- crew %>% 
+    filter(job=="Director") %>% 
+    count(movie_id) %>% 
+    filter(n==1)
+
+movies <- left_join(movies, crew %>% 
+                filter(job=="Director" & movie_id %in% 
+                movies1Director$movie_id) %>% 
+                select(id=movie_id, director=crew), by = "id")
+
+```
+
+
+##EXPLORATORY DATA ANALYSIS
+
+```{r}
+##VOTES
+#Histograms
+movies %>% ggplot(aes(x=vote_count)) +
+  geom_histogram(fill="purple", binwidth = 50) +
+  coord_cartesian(x=c(0,5000)) +
+  scale_x_continuous(breaks=seq(0, 5000, by=500), label=comma) +
+  labs(x= "Vote count", y="Number of movies",
+       title = "Histogram for Vote count")
+
+movies %>% ggplot(aes(x=vote_average)) +
+  geom_histogram(fill="purple", color="darkblue", binwidth = 0.1) +
+  scale_x_continuous(breaks=seq(0, 10, by=1)) +
+  labs(x= "Vote average", y="Number of movies",
+       title = "Histogram for Vote average")
+
+
+#Movies with highest vote count
+movies %>% arrange(desc(vote_count)) %>% 
+  top_n(20, vote_count) %>%
+  ggplot(aes(x=reorder(title,vote_count), y=vote_count)) + 
+  geom_col(fill="orange") +
+  coord_flip() + 
+  labs(x="Movie title", y= "Vote count",
+       title = "Top 20 Movies with highest vote count") +
+  geom_text(aes(label = vote_count), nudge_y = -550.5)+
+  theme_classic() 
+
+#Movies with highest vote average that have atleast 300 vote count
+movies %>% filter(vote_count >300) %>%
+  arrange(desc(vote_average)) %>% 
+  top_n(20, vote_average) %>%
+  ggplot(aes(x=reorder(title,vote_average), y=vote_average)) + 
+  geom_col(fill="orange") +
+  coord_flip() + 
+  labs(x="Movie title", y= "Vote average",
+       title = "Top 20 Movies with highest vote average") +
+  geom_text(aes(label = vote_average),nudge_y = -0.2)+
+  theme_classic() 
+
+#scatterplot
+movies %>% ggplot(aes(x=vote_average, y=popularity)) +
+  geom_point()
+
+movies %>% ggplot(aes(x=vote_average, y=vote_count)) +
+  geom_point()
+
+movies %>% ggplot(aes(x=runtime, y=popularity)) +
+  geom_point()
+
+```
+
+
+```{r}
+##BUDGET & REVENUE
+#Top 10 Most Expensive Movies
+movies %>% select(original_title,budget) %>% 
+  drop_na(original_title)%>% top_n(10, budget) %>%  
+  ggplot(aes(reorder(original_title,budget),y=budget, fill=original_title))+
+  geom_col(stat="identity")+ coord_flip()+
+  scale_y_continuous(labels=scales::comma)+
+  labs(x="",y="Total Budget",title="Top 10 Most Expensive Movies") + 
+  theme(legend.position = "none")
+
+#Top 10 Highest Grossing Movies
+movies %>% select(original_title,revenue) %>% 
+  drop_na(original_title)%>% top_n(10, revenue) %>% 
+  ggplot(aes(reorder(original_title,revenue),y=revenue,fill=original_title))+
+  geom_col(stat="identity")+ coord_flip()+
+  scale_y_continuous(limits=c(0,3000000000),breaks=seq(0,3000000000,500000000),labels=scales::comma)+
+  labs(x="",y="Total Revenue", title="Top 10 Highest Grossing Movies")  + 
+  theme(legend.position = "none") 
+
+```
+
+
+```{r}
+##ORIGINAL LANGUAGES
+#Most popular languages for movies
+movies %>% count(original_language) %>% 
+  top_n(20,n) %>%
+  ggplot(aes(x=reorder(original_language,n), y=n)) + 
+  geom_col(fill="red") + coord_flip()+
+  labs(x="Original language", y="count of movies",
+       title = "Most popular languages for movies")
+
+#Most popular languages for movies EXCEPT ENGLISH
+movies %>% filter(!original_language == "en")%>% 
+  count(original_language) %>% 
+  top_n(20,n) %>%
+  ggplot(aes(x=reorder(original_language,n), y=n)) + 
+  geom_col(fill="red") + coord_flip() +
+  labs(x="Original language", y="count of movies",
+       title = "Most popular languages for movies")
+```
+
+
+```{r}
+##GENRES
+Genre_count <- genres %>% 
+  group_by(genres, title) %>% 
+  summarise(genre_count= n()) %>% 
+  arrange(desc(genre_count))
+
+#Pie chart of Percentage movies by Genres
+plot_ly(Genre_count, labels = ~genres, values = ~genre_count, type = 'pie')%>%
+  layout(title="Pie chart of Percentage of Genres")
+
+#Highest rated movies by genre
+genres250 <- left_join(genres, movies %>% filter(vote_count > 250) %>% 
+             select(id, vote_average, vote_count, original_language, original_title), by = "id")
+genres250 <- genres250 %>% filter(!is.na(genres250$vote_average))
+genres250$title <- str_trunc(as.character(genres250$title), width = 50, side="right")
+genres250$title <- as.factor(genres250$title)
+
+genres250 %>% filter(!genres %in% c("Foreign", "TV Movie")) %>%
+        group_by(genres) %>% arrange(desc(vote_average)) %>% slice(1:10) %>%
+        ggplot(aes(x=reorder(title, vote_average), y=vote_average)) +
+        geom_col(aes(fill=genres), show.legend = FALSE) + coord_flip(y=c(6,8.5)) +
+        facet_wrap(~genres, scales = "free_y", ncol=2) +
+        labs(x="", y="") +
+        theme(axis.text.y = element_text(size=6))
+
+
+```
+
+
+```{r}
+##ACTORS & DIRECTORS
+#Top 20 actors
+Top20_actors <- cast1 %>% top_n(20,n)
+
+Top20_actors%>%
+  ggplot(aes(x=reorder(actor,n), y=n)) + 
+  geom_col(fill="darkgreen")+
+  coord_flip() + labs(y="Number of movies",
+                      x = "",
+                      title = "Top 20 Actors")
+
+#Wordcloud of top actors
+set.seed(1)
+par(mfrow=c(1, 1),bg="grey97")
+wordcloud(Top20_actors$actor, Top20_actors$n, max.words = 100, scale=c(2.0,.5), 
+          random.color = TRUE, random.order=FALSE, rot.per=0, 
+          colors=brewer.pal(9,"Set1"))
+
+#Top 20 Directors
+Top20_dir <- movies %>% filter(!is.na(movies$director)) %>% 
+             count(director) %>% top_n(20, wt=n)
+
+
+Top20_dir%>%
+        ggplot(aes(x=reorder(director, n), y=n)) +
+        geom_col(fill="darkgreen") + coord_flip() +
+        labs(x="", y="Number of movies",
+             title = "Directors with most movies")
+
+```
+
+
+
+```{r}
+##KEYWORDS
+#Most used keywords
+keywords %>% count(keyword) %>% top_n(20, wt=n) %>%
+  treemap(index = "keyword", vSize="n",title = "Treemap of top 20 Keywords")
+
+#Histogram of number of keywords per movie
+keywords %>% count(id, title)%>%
+    ggplot(aes(x=n)) +
+        geom_histogram( breaks = seq(0, 100, by=2), fill="violet", color = "purple") +
+        scale_x_continuous(breaks = seq(0, 100, by=10)) +
+        labs(x="Number of keywords per movie", y= "Number of Movies",
+             title = "Histogram of number of keywords per movie")
+
+```
+
+#A wordcloud representation of genres that are most representative of losses
+```{r}
+
+#Genres which incur high losses
+colnames(movies)
+loss_movies<-movies %>% filter(revenue!=0) %>%mutate(profit=revenue-budget)%>%
+  select(title,budget,revenue,profit,id)%>% filter(profit<0) %>% left_join(genres) %>% group_by(genres) %>%
+  summarise(freq=n())
+
+#Plot the genres in a wordcloud
+set.seed(1)
+par(mfrow=c(1, 1),bg="grey97")
+wordcloud(loss_movies$genres, loss_movies$freq, max.words = , scale=c(5.0,.8), 
+          random.color = TRUE, random.order=FALSE, rot.per=0, 
+          colors=brewer.pal(9,"Set2"))
+
+```
+
+
+#How is the number of votes a movie receives and the popularity of a movie related  ? (Linear)
+```{r}
+#relationship between popularity of a movie and the vote_count it receives
+glimpse(movies$popularity)
+glimpse(movies$vote_count)
+
+popularity <- movies %>%  select(popularity,vote_count) %>% mutate(norm_popl= log(popularity),norm_vc=log(vote_count))
+
+popularity %>% ggplot(aes(norm_popl,norm_vc)) +geom_point()+labs(x="log normalized vote counts",y="log normalized popularity",title="vote_count vs popularity")
+```
+
+#How is the profit a movie related to popularity ? (Exponential)
+
+```{r}
+movies %>% select(title,popularity,budget,revenue) %>% filter(revenue!=0)%>% mutate(profit=revenue-budget,norm_pop=log(popularity),norm_prof=log(profit)) %>% ggplot(aes(norm_pop,norm_prof))+geom_point()+ylim(15,20)+labs(x="log normalized popularity",y="log normalized profit",title="popularity vs profit")
+```
+
+```{r}
+#releases per year from 2010 and beyond by genre - Rasagnya
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+gen <- genres %>% inner_join(movies,by="id")
+gen$release_date<-year(gen$release_date)
+gen %>%
+  filter(release_date>2010) %>%
+  count(genres.x,release_date, sort = TRUE) %>%
+  filter(n>30) %>%
+  ggplot(aes(x=as.factor(release_date),y=n,fill=genres.x)) +
+  geom_col(show.legend = F) +
+  facet_wrap(~genres.x,ncol=3,scales="free") +
+  labs(title="# of releases per year", x="Year", y="Count") + theme_minimal()
+
+ 
+```
+
+
+
+
+
+
+## MODELING
+
+## Rating formula 
+
+
+```{r}
+#calculating mean votes for the movie and the minimum votes required for the movie to be eligible to get a user rating
+avgvt <- mean(movies$vote_average)
+min_v <- quantile(movies$vote_count, 0.6)
+
+#calculating the IMDB rating of the movie
+
+movies$weighted_rating <- (movies$vote_average*movies$vote_count +
+                             avgvt*min_v)/(movies$vote_count + min_v)
+movies %>%
+  mutate(IMDB_rating = weighted_rating)
+movies$rottentomatoes <-(movies$vote_average/2)
+movies$tomatometer <- ifelse(movies$rottentomatoes>2.95,"Fresh","Rotten")
+movies$tomatometer <- ifelse(movies$rottentomatoes> 3.75,"Designated Fresh",movies$tomatometer)
+
+#viewing the top 250 user rated movies
+wav<-movies %>% top_n(250, wt=weighted_rating)
+glimpse(wav)
+wav<-wav %>%
+  select(id,title,popularity,vote_average,vote_count,weighted_rating,tomatometer)
+print(wav)
+
+#viewing the bottom 100 user rated movies
+bott<-movies %>% top_n(-100, wt=weighted_rating)
+bott<-bott %>%
+  select(id,title,popularity,vote_average,vote_count,weighted_rating,tomatometer)
+print(bott)
+
+
+#plotting top 15 movies with their IMDB and rotten tomatoes ratings
+wavg<- movies %>% top_n(15, wt=weighted_rating) %>%
+  ggplot(aes(x=reorder(title, weighted_rating), y=weighted_rating)) +
+  geom_col(fill="red") + coord_flip(y=c(0,9)) +
+  labs(x=" Top 15 Movies", y="IMDB Weighted Rating") +
+  geom_text(aes(label=round(weighted_rating, 2)), hjust=-0.1, size=3) +
+ scale_y_continuous(breaks=seq(0, 9, by=1)) +
+  geom_text(aes(label=paste("Votes:", vote_count, "Vote Average:", vote_average)), 
+            y=2.3, size=3, col="white")
+print(wavg)
+
+#Bottom 15 movies
+bottom<- movies %>% top_n(-15, wt=weighted_rating) %>%
+  ggplot(aes(x=reorder(title, weighted_rating), y=weighted_rating)) +
+  geom_col(fill="blue") + coord_flip(y=c(0,9)) +
+  labs(x="Bottom Movies", y="IMDB Weighted Rating") +
+  geom_text(aes(label=round(weighted_rating, 2)), hjust=-0.1, size=3) +
+ scale_y_continuous(breaks=seq(0, 9, by=1)) +
+  geom_text(aes(label=paste("Votes:", vote_count, "Vote Average:", vote_average)), 
+            y=2.3, size=3, col="white")
+print(bottom)
+
+```
+
+
+### Simple Recommendation based on weighted rating, genre and language 
+
+```{r}
+#Simple recommendations based on selected genre and language
+genres250 <- left_join(genres250, movies %>% select(id, weighted_rating), by="id")
+
+Genre_lang_recommend <- function(Genre, Language="en") {
+        genres250 %>% filter(original_language==Language & genres==Genre) %>%
+                arrange(desc(weighted_rating)) %>% top_n(5)
+}
+
+#Most popular languages for movies by Genre
+genres250 %>% filter(!original_language == "en")%>% 
+  count( genres, original_language) %>% 
+  top_n(20,n) %>%
+  ggplot(aes(x=reorder(original_language,n), y=n, fill=genres)) + 
+  geom_col() + coord_flip() +
+  labs(x="Original language", y="count of movies",
+       title = "Most popular languages for movies by Genre")
+
+#Test run example
+kable(Genre_lang_recommend("Comedy", "fr"))
+
+
+
+#Plotting the results from simple recommender
+(Genre_lang_recommend("Comedy", "fr")) %>%
+  ggplot(aes(x=reorder(title,weighted_rating), y=weighted_rating, fill=title)) +
+  geom_col(show.legend = FALSE) + coord_flip()+
+  labs(x="", y="Weighted Rating",
+       title = "Top 5 Movies for the chose Genre and Language")+
+  theme(axis.title = element_text(size=12, color = "black"))+
+  theme_classic()
+
+
+```
+
+
+### Content based (Actors, Directors, genres) 
+
+```{r}
+
+similarfactors <- c("actor_1", "actor_2", "actor_3", "director", "genre_1", "genre_2", "genre_3")
+
+movies_final <- movies %>% 
+  select(id, title, !!similarfactors)
+movies_final <- movies_final %>% 
+  mutate_if(is.factor, as.character)
+
+similar_content_recommendation <- function(movie){
+        director <- movies_final$director[movies_final$title==movie]
+actor1 <- movies_final$actor_1[movies_final$title==movie]
+actor2 <- movies_final$actor_2[movies_final$title==movie]
+actor3 <- movies_final$actor_3[movies_final$title==movie]
+genre1 <- movies_final$genre_1[movies_final$title==movie]
+genre2 <- movies_final$genre_2[movies_final$title==movie]
+genre3 <- movies_final$genre_3[movies_final$title==movie]
+
+recommenddataset <- movies_final
+
+recommenddataset$same_director <- NA
+recommenddataset$same_a1 <- NA
+recommenddataset$same_a2 <- NA
+recommenddataset$same_a3 <- NA
+recommenddataset$same_g1 <- NA
+recommenddataset$same_g2 <- NA
+recommenddataset$same_g3 <- NA
+
+recommenddataset$same_director <- ifelse(recommenddataset$director==director, 1, 0)
+recommenddataset$same_a1 <- ifelse(recommenddataset$actor_1==actor1|recommenddataset$actor_2==actor1|recommenddataset$actor_3==actor1, 1, 0)
+recommenddataset$same_a2 <- ifelse(recommenddataset$actor_1==actor2|recommenddataset$actor_2==actor2|recommenddataset$actor_3==actor2, 1, 0)
+recommenddataset$same_a3 <- ifelse(recommenddataset$actor_1==actor3|recommenddataset$actor_2==actor3|recommenddataset$actor_3==actor3, 1, 0)
+recommenddataset$same_g1 <- ifelse(recommenddataset$genre_1==genre1|recommenddataset$genre_2==genre1|recommenddataset$genre_3==genre1, 1, 0)
+recommenddataset$same_g2 <- ifelse(recommenddataset$genre_1==genre2|recommenddataset$genre_2==genre2|recommenddataset$genre_3==genre2, 1, 0)
+recommenddataset$same_g3 <- ifelse(recommenddataset$genre_1==genre3|recommenddataset$genre_2==genre3|recommenddataset$genre_3==genre3, 1, 0)
+
+recommenddataset <- recommenddataset %>% mutate_at(vars("same_director": "same_g3"), list(~replace(., is.na(.), 0)))
+
+recommenddataset$similarcount <- rowSums(recommenddataset[,10:16])
+recommenddataset <- left_join(recommenddataset, movies %>% select(id, weighted_rating), by="id")
+
+Top5_recommendations <- recommenddataset %>% arrange(desc(similarcount), desc(weighted_rating)) %>% slice(1:6) %>% select(id, title, similarcount, weighted_rating, everything())
+
+kable(Top5_recommendations) %>%
+        kable_styling(full_width=TRUE, stripe_color = "black",bootstrap_options = c("striped", "hover", "condensed", "responsive"), font_size = 15, position = "float_left") %>%
+  row_spec(1:6,color = "black")
+
+}
+
+similar_content_recommendation("Avatar")
+```
+
+## Recommendations based on similarity of the plots 
+	
+```{r}
+#Recommendations based on similarity of the plots
+movie_plots <- movies %>% 
+    dplyr::select(id, title, text=overview)
+
+#Checking plot for random movie using ID
+movie_plots$text[movie_plots$id==13]
+
+#Getting in tidy format
+tidy_plots <- movie_plots %>%
+        unnest_tokens(word, text)  %>%
+        count(id, title, word, sort=TRUE)
+
+#Removing numbers
+tidy_plots <- tidy_plots %>% filter(!str_detect(word, "[0-9]"))
+
+#Getting total words per movie
+total_words <- tidy_plots %>% group_by(id, title) %>% summarize(total = sum(n))
+tidy_plots <- left_join(tidy_plots, total_words, by = c("id", "title"))
+
+#Getting td-idf for words that were in atleast 10 plots
+tidy_plots <- tidy_plots %>% bind_tf_idf(word, id, n)
+tidy_plots <- tidy_plots %>% filter(idf<=log(length(unique(tidy_plots$id))/10))
+
+Top10_words <- tidy_plots %>% group_by(id) %>% arrange(desc(tf_idf)) %>% top_n(10)
+
+kable(Top10_words %>% filter(id==13))
+
+
+#Recommender based on sentiment of plot
+sentiments_plot <- tidy_plots%>%
+    inner_join(get_sentiments("nrc"), by=c("word"="word")) %>%
+    count(id, title, word, sentiment, sort=TRUE) 
+    
+
+sentiment_recommend <- function(feeling){
+  sentiments_plot %>%
+    filter(sentiment == feeling) %>%
+    count(id, title, sentiment, sort = TRUE)%>%
+    arrange(desc(n)) %>%
+    head(5) %>%
+    kable()
+}
+
+sentiment_recommend_df <- function(feeling){
+  result<-sentiments_plot %>%
+    filter(sentiment == feeling) %>%
+    count(id, title, sentiment, sort = TRUE)%>%
+    arrange(desc(n)) %>%
+    head(5)
+  return(result)
+}
+
+sentiment_recommend_df("joy")
+
+
+
+#Plotting the results from recommender
+sentiment_recommend_df("fear") %>%
+  ggplot(aes(x=reorder(title,n), y=n, fill=title)) + 
+  geom_col(show.legend = FALSE)+
+  coord_flip()+
+  labs(x="", 
+       title = "Top 5 movies associated 
+       with particular sentiment") +
+  theme(axis.title = element_text(size=12, color = "black"))+
+  theme_classic()
+
+
+
+```
+### Collaborative Filtering 
+
+```{r}
+
+#loading the ratings of movies
+ratings_small <- read_csv( "ratings_small.csv", na="NA", col_types = 
+  cols(
+    userId = col_character(),
+    movieId = col_character(),
+    rating = col_double(),
+    timestamp = col_double()
+  )
+)
+
+#loading the movie names and movie ids
+movie_names <- read_csv("movies_metadata.csv", na="NA", col_types = 
+  cols_only(
+    id = col_character(),
+    title = col_character()
+  )
+)
+
+#filtering the ratings dataset to include only the movies which we have in our TMDB dataset
+ratings_small<-ratings_small%>%filter(movieId %in% movie_names$id)
+
+#Formatting the timestap variable
+ratings_small$timestamp <- as.POSIXct(ratings_small$timestamp, tz="UTC", origin='1970-01-01')
+
+#preprocessing to create a rating matrix with users as the rows and with movies as columns and removing timestamp
+rat_mat <- ratings_small %>% select(-timestamp) %>% 
+  spread(movieId, rating) %>%
+  remove_rownames %>%
+  column_to_rownames(var="userId")
+
+#converting the data to matrix
+rat_mat <- as.matrix(rat_mat)
+
+dimnames(rat_mat) <- list(user= rownames(rat_mat), item = colnames(rat_mat))
+
+#creating a "realRatingMatrix" to create a collaborative filtering model
+movies_matrix <- as(rat_mat, "realRatingMatrix")
+class(movies_matrix)
+
+#threshold for getting movies with only a minimum number of ratings as 50- helps us to get
+#data that have some validity
+movie_ratings <- movies_matrix[rowCounts(movies_matrix) > 50,
+                             colCounts(movies_matrix) > 50]
+
+#sampling data to create training and testing data
+sampled_data<- sample(x = c(TRUE, FALSE),
+                      size = nrow(movie_ratings),
+                      replace = TRUE,
+                      prob = c(0.8, 0.2))
+training_data <- movie_ratings[sampled_data, ]
+testing_data <- movie_ratings[!sampled_data, ]
+
+#using the default settings to carry out Item Based Collaborative Filter
+recommendation_system <- recommenderRegistry$get_entries(dataType ="realRatingMatrix")
+#recommendation_system$IBCF_realRatingMatrix$parameters
+recommen_model <- Recommender(data = training_data,
+                          method = "IBCF",
+                          parameter = list(k = 30))
+#recommen_model
+#class(recommen_model)
+
+
+
+#items to recommend to each user
+top_recommendations <- 10 
+predicted_recommendations <- predict(object = recommen_model,
+                          newdata = testing_data,
+                          n = top_recommendations)
+predicted_recommendations
+
+#get the recomended movies for the related user(user1)  for user2 and display the titles of the movies 
+user1 <- predicted_recommendations@items[[1]] 
+movies_user1 <- predicted_recommendations@itemLabels[user1]
+movies_user2 <- movies_user1
+for (index in 1:10){
+  movies_user2[index] <- as.character(subset(movie_names,
+                                         movie_names$id == movies_user1[index])$title)
+}
+movies_user2
+
+
+#Setting evaluation scheme taking 3 unseen samples out of test and doing four cross k-fold #validation
+scheme <- evaluationScheme(movie_ratings, method="cross", k=4, given=3,
+ goodRating=5)
+#Evaluating  top-1,top-3 and top-5
+results <- evaluate(scheme, method="POPULAR", type = "topNList",
+ n=c(1,3,5))
+#displaying confusion matrix
+getConfusionMatrix(results)[[1]]
+#showing the average of all runs
+avg(results)
+#plotting the results TPR vs FPR
+plot(results,annotate=TRUE)
+#plotting the results precision vs recall
+plot(results, "prec/rec", annotate=TRUE)
+
+
+```
+
+
+
+
